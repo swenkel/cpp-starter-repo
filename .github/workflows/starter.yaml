@@ -1,0 +1,201 @@
+name: Starter validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest
+  matrix:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    outputs:
+      cases: ${{ steps.cases.outputs.cases }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: cases
+        run: echo "cases=$(python3 -m starter.smoke --list-json)" >> "$GITHUB_OUTPUT"
+  integration:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        configuration: ${{ fromJSON(needs.matrix.outputs.cases).include }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.os == 'ubuntu-24.04' && 'ubuntu:26.04' || '' }}
+    env:
+      CONAN_HOME: ${{ github.workspace }}/.cache/conan
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y python3
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: starter-${{ runner.os }}-${{ hashFiles('starter/versions.py') }}-${{ matrix.configuration.dependencies }}
+      - run: |
+          python3 -c 'from starter.render_config import INSTALL_TOOLS; print(INSTALL_TOOLS)' > /tmp/install-tools.sh
+          sh /tmp/install-tools.sh qt
+      - name: Generate and check
+        run: |
+          export PATH="$PWD/.tools/bin:/usr/lib/llvm-21/bin:$PATH"
+          if [ "$(uname -s)" = Darwin ]; then
+            export PATH="$(brew --prefix llvm@21)/bin:$PATH"
+            export QT_ROOT="$(brew --prefix qt)"
+          fi
+          python3 -m starter.smoke --profile '${{ matrix.configuration.profile }}' --build-system '${{ matrix.configuration.build_system }}' --dependencies '${{ matrix.configuration.dependencies }}' --test-runner '${{ matrix.configuration.test_runner }}' --keep /tmp/starter-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-${{ matrix.os }}-${{ matrix.configuration.profile }}-${{ matrix.configuration.build_system }}-${{ matrix.configuration.dependencies }}-${{ matrix.configuration.test_runner }}
+          path: |
+            /tmp/starter-results/*.log
+            /tmp/starter-results/**/reports/
+  qt-provider:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        provider: [conan, vcpkg]
+        backend: [cmake, meson]
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.os == 'ubuntu-24.04' && 'ubuntu:26.04' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y python3
+      - run: |
+          python3 -c 'from starter.render_config import INSTALL_TOOLS; print(INSTALL_TOOLS)' > /tmp/install-tools.sh
+          sh /tmp/install-tools.sh qt-build
+      - run: |
+          export PATH="$PWD/.tools/bin:/usr/lib/llvm-21/bin:$PATH"
+          if [ "$(uname -s)" = Darwin ]; then export PATH="$(brew --prefix llvm@21)/bin:$PATH"; fi
+          python3 -m starter.smoke --profile qt --qt-source provider --dependencies '${{ matrix.provider }}' --build-system '${{ matrix.backend }}' --test-runner gtest --keep /tmp/qt-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qt-${{ matrix.os }}-${{ matrix.backend }}-${{ matrix.provider }}
+          path: /tmp/qt-results/*.log
+  shared-library:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        backend: [cmake, meson]
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.os == 'ubuntu-24.04' && 'ubuntu:26.04' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y python3
+      - run: |
+          python3 -c 'from starter.render_config import INSTALL_TOOLS; print(INSTALL_TOOLS)' > /tmp/install-tools.sh
+          sh /tmp/install-tools.sh
+      - run: |
+          export PATH="$PWD/.tools/bin:/usr/lib/llvm-21/bin:$PATH"
+          if [ "$(uname -s)" = Darwin ]; then export PATH="$(brew --prefix llvm@21)/bin:$PATH"; fi
+          python3 -m starter.smoke --profile library --library-type shared --dependencies native --build-system '${{ matrix.backend }}' --test-runner gtest --keep /tmp/shared-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shared-${{ matrix.os }}-${{ matrix.backend }}
+          path: /tmp/shared-results/*.log
+  qt-source:
+    needs: matrix
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        backend: [cmake, meson]
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.os == 'ubuntu-24.04' && 'ubuntu:26.04' || '' }}
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y python3
+      - run: |
+          python3 -c 'from starter.render_config import INSTALL_TOOLS; print(INSTALL_TOOLS)' > /tmp/install-tools.sh
+          sh /tmp/install-tools.sh qt-build
+      - run: |
+          export PATH="$PWD/.tools/bin:/usr/lib/llvm-21/bin:$PATH"
+          if [ "$(uname -s)" = Darwin ]; then export PATH="$(brew --prefix llvm@21)/bin:$PATH"; fi
+          python3 -m starter.smoke --profile qt --qt-source source --dependencies native --build-system '${{ matrix.backend }}' --test-runner gtest --keep /tmp/qt-source-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qt-source-${{ matrix.os }}-${{ matrix.backend }}
+          path: |
+            /tmp/qt-source-results/*.log
+            /tmp/qt-source-results/**/reports/
+  qt-image:
+    needs: matrix
+    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the local SDK image fixture
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from starter.answers import parse
+          from starter.apply import write_tree
+          from starter.plan import build
+          answers = parse(dict(name='qt-sdk-fixture', profile='qt', qt_source='installed', git_init='no', ci='none'))
+          write_tree(Path('/tmp/qt-sdk'), build(answers), answers)
+          PY
+          docker build -t cpp-starter-qt-sdk:ci /tmp/qt-sdk
+      - name: Check both build systems using the prebuilt image
+        run: python3 -m starter.smoke --profile qt --qt-source image --environment docker --container-image cpp-starter-qt-sdk:ci --dependencies native --test-runner gtest --keep /tmp/qt-image-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qt-image-linux
+          path: |
+            /tmp/qt-image-results/*.log
+            /tmp/qt-image-results/**/reports/
+  defect-detection:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        backend: [cmake, meson]
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.os == 'ubuntu-24.04' && 'ubuntu:26.04' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y python3
+      - run: |
+          python3 -c 'from starter.render_config import INSTALL_TOOLS; print(INSTALL_TOOLS)' > /tmp/install-tools.sh
+          sh /tmp/install-tools.sh
+      - name: Verify gates reject injected defects
+        run: |
+          export PATH="$PWD/.tools/bin:/usr/lib/llvm-21/bin:$PATH"
+          if [ "$(uname -s)" = Darwin ]; then export PATH="$(brew --prefix llvm@21)/bin:$PATH"; fi
+          python3 -m starter.negative --build-system '${{ matrix.backend }}' --keep /tmp/defect-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: defects-${{ matrix.os }}-${{ matrix.backend }}
+          path: /tmp/defect-results/probe-*.log
